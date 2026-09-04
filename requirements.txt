@@ -10,3 +10,4 @@ python-multipart
 pgvector
 celery
 redis
+bcrypt==4.0.1
