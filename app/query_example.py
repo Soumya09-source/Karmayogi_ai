@@ -22,13 +22,7 @@ MODEL_NAME = "all-MiniLM-L6-v2"
 
 
 def get_connection():
-    conn = psycopg2.connect(
-        host=os.environ["PGHOST"],
-        port=os.environ.get("PGPORT", 5432),
-        dbname=os.environ["PGDATABASE"],
-        user=os.environ["PGUSER"],
-        password=os.environ["PGPASSWORD"],
-    )
+    conn = psycopg2.connect(os.environ["DATABASE_URL"])
     register_vector(conn)
     return conn
 
