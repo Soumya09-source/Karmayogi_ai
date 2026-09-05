@@ -1,5 +1,5 @@
 import random
-
+import numpy as np
 from sqlalchemy.orm import Session
 
 from app.models.concept_mastery import ConceptMastery
@@ -17,17 +17,11 @@ def get_gap_concepts(
     employee_id: str,
     threshold: float = MASTERY_THRESHOLD
 ):
-    """
-    Find concepts where the employee's current mastery
-    is below the required threshold.
-    """
-
     gaps = (
         db.query(ConceptMastery, ConceptTaxonomy)
         .join(
             ConceptTaxonomy,
-            ConceptMastery.concept_id
-            == ConceptTaxonomy.canonical_concept_id
+            ConceptMastery.concept_id == ConceptTaxonomy.canonical_concept_id
         )
         .filter(
             ConceptMastery.employee_id == employee_id,
@@ -39,7 +33,8 @@ def get_gap_concepts(
     return [
         {
             "concept_id": mastery.concept_id,
-            "domain": concept.parent_domain
+            "domain": concept.parent_domain,
+            "embedding": concept.embedding,   # <-- added, needed by get_similarity_scores
         }
         for mastery, concept in gaps
     ]
@@ -53,23 +48,36 @@ def get_candidate_courses(db: Session):
     return db.query(Course).all()
 
 
+
 def get_similarity_scores(concept, candidate_courses):
     """
-    Temporary seam for the AI embedding pipeline.
-
-    Random scores will later be replaced with
-    real embedding similarity.
+    Real embedding-based similarity: cosine similarity between the gap
+    concept's embedding and each candidate course's embedding.
     """
+    if concept.get("embedding") is None:
+        return []  # can't score a concept with no embedding yet — skip it
+                    # rather than crash; it just won't get any recommendation
+                    # until the embedding pipeline catches up
+
+    concept_vector = np.array(concept["embedding"], dtype=float)
+    concept_norm = np.linalg.norm(concept_vector)
 
     scores = []
-
     for course in candidate_courses:
-        scores.append(
-            {
-                "course_id": course.course_id,
-                "score": random.uniform(0.0, 1.0)
-            }
-        )
+        if course.embedding is None:
+            continue
+
+        course_vector = np.array(course.embedding, dtype=float)
+        course_norm = np.linalg.norm(course_vector)
+
+        if concept_norm == 0 or course_norm == 0:
+            similarity = 0.0
+        else:
+            similarity = float(
+                np.dot(concept_vector, course_vector) / (concept_norm * course_norm)
+            )
+
+        scores.append({"course_id": course.course_id, "score": similarity})
 
     return scores
 
