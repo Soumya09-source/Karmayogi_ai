@@ -1,35 +1,64 @@
 import random
 
+from sqlalchemy.orm import Session
+
+from app.models.concept_mastery import ConceptMastery
+from app.models.concept import ConceptTaxonomy
+from app.models.course import Course
+from app.models.recommendation import Recommendation
+
 
 DOMAIN_BOOST_FACTOR = 1.2
+MASTERY_THRESHOLD = 0.7
 
 
-def get_gap_concepts(employee_id: str):
+def get_gap_concepts(
+    db: Session,
+    employee_id: str,
+    threshold: float = MASTERY_THRESHOLD
+):
     """
-    Temporary stub for gap detection.
-
-    Later this will query concept_mastery where:
-    employee_id matches and p_mastery < threshold.
+    Find concepts where the employee's current mastery
+    is below the required threshold.
     """
+
+    gaps = (
+        db.query(ConceptMastery, ConceptTaxonomy)
+        .join(
+            ConceptTaxonomy,
+            ConceptMastery.concept_id
+            == ConceptTaxonomy.canonical_concept_id
+        )
+        .filter(
+            ConceptMastery.employee_id == employee_id,
+            ConceptMastery.p_mastery_current < threshold
+        )
+        .all()
+    )
 
     return [
         {
-            "concept_id": "concept_1",
-            "domain": "statistics"
-        },
-        {
-            "concept_id": "concept_2",
-            "domain": "data_analysis"
+            "concept_id": mastery.concept_id,
+            "domain": concept.parent_domain
         }
+        for mastery, concept in gaps
     ]
+
+
+def get_candidate_courses(db: Session):
+    """
+    Fetch available courses from the database.
+    """
+
+    return db.query(Course).all()
 
 
 def get_similarity_scores(concept, candidate_courses):
     """
     Temporary seam for the AI embedding pipeline.
 
-    Later the AI/embedding person can replace this function
-    with real vector similarity scores.
+    Random scores will later be replaced with
+    real embedding similarity.
     """
 
     scores = []
@@ -55,20 +84,20 @@ def apply_domain_boost(
     capped at 1.0.
     """
 
-    if employee_domain == course_domain:
-        boosted = raw_score * DOMAIN_BOOST_FACTOR
-    else:
-        boosted = raw_score
+    if employee_domain and course_domain:
+        if employee_domain.lower() == course_domain.lower():
+            raw_score *= DOMAIN_BOOST_FACTOR
 
-    return min(boosted, 1.0)
+    return min(raw_score, 1.0)
+
 
 def rank_recommendations(
     raw_recommendations: list,
     top_n: int = 5
 ):
     """
-    Deduplicate courses, keeping the highest score for each course,
-    then rank and return the top N recommendations.
+    Deduplicate courses, keeping the highest score
+    for each course.
     """
 
     best_courses = {}
@@ -91,29 +120,87 @@ def rank_recommendations(
 
     return ranked[:top_n]
 
+
+def save_recommendations(
+    db: Session,
+    recommendations: list
+):
+    """
+    Save generated recommendations to the database.
+    """
+
+    saved_recommendations = []
+
+    for item in recommendations:
+
+        existing = (
+            db.query(Recommendation)
+            .filter(
+                Recommendation.employee_id == item["employee_id"],
+                Recommendation.gap_concept_id == item["gap_concept_id"],
+                Recommendation.recommended_course_id == item["course_id"]
+            )
+            .first()
+        )
+
+        if existing:
+            existing.similarity_score = item["score"]
+            existing.status = "active"
+
+            saved_recommendations.append(existing)
+
+        else:
+            recommendation = Recommendation(
+                employee_id=item["employee_id"],
+                gap_concept_id=item["gap_concept_id"],
+                recommended_course_id=item["course_id"],
+                similarity_score=item["score"],
+                status="active"
+            )
+
+            db.add(recommendation)
+            saved_recommendations.append(recommendation)
+
+    db.commit()
+
+    for recommendation in saved_recommendations:
+        db.refresh(recommendation)
+
+    return saved_recommendations
+
+
 def generate_recommendations(
+    db: Session,
     employee_id: str,
-    candidate_courses: list,
     top_n: int = 5
 ):
     """
-    Generate recommendations for an employee.
+    Generate and save course recommendations for an employee.
 
-    Uses temporary gap concepts and fake similarity scores
-    until the real BKT and embedding pipelines are connected.
+    Uses:
+    - Real BKT concept mastery data
+    - Real courses from the database
+    - Temporary random similarity scores
     """
 
-    gap_concepts = get_gap_concepts(employee_id)
+    gap_concepts = get_gap_concepts(
+        db=db,
+        employee_id=employee_id
+    )
+
+    candidate_courses = get_candidate_courses(db)
 
     raw_recommendations = []
 
     for gap in gap_concepts:
+
         similarity_scores = get_similarity_scores(
             gap,
             candidate_courses
         )
 
         for similarity in similarity_scores:
+
             course = next(
                 (
                     course
@@ -141,7 +228,12 @@ def generate_recommendations(
                 }
             )
 
-    return rank_recommendations(
+    ranked_recommendations = rank_recommendations(
         raw_recommendations,
         top_n
+    )
+
+    return save_recommendations(
+        db,
+        ranked_recommendations
     )
