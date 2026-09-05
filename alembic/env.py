@@ -16,6 +16,12 @@ from app.models.user import User
 from app.models.concept import ConceptTaxonomy
 from app.models.course import Course
 from app.models.document_chunk import DocumentChunk, ChunkDomainTag
+from app.models.employee_profile import EmployeeProfile
+from app.models.employee_training_history import EmployeeTrainingHistory
+from app.models.competency_matrix import CompetencyFrameworkMatrix
+from app.models.mcq import MCQ
+from app.models.assessment_history import AssessmentHistory
+from app.models.concept_mastery import ConceptMastery
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
