@@ -7,9 +7,9 @@ from app.core.deps import require_role
 from app.db import get_db
 from app.models.course import Course
 from app.models.document_chunk import DocumentChunk
-from app.services.embedding_service import embed_texts_for_app
 from app.services.storage_service import upload_file
 from app.services.text_processing_service import extract_text, chunk_text
+from app.tasks.ingestion import embed_course_task
 
 
 router = APIRouter(
@@ -36,6 +36,7 @@ def upload_course(
     course_id = f"course_{uuid.uuid4().hex[:12]}"
 
     try:
+        # Extract text from uploaded file
         extracted_text = extract_text(file.file, file.filename)
 
     except ValueError as e:
@@ -74,34 +75,32 @@ def upload_course(
     # Split extracted text into chunks
     chunks = chunk_text(extracted_text)
 
-    # Generate embeddings for all chunks
-    embeddings = []
-
-    if chunks:
-        embeddings = embed_texts_for_app(chunks)
-
-    # Save chunks with their embeddings
-    for index, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+    # Save chunks WITHOUT embeddings
+    for index, chunk in enumerate(chunks):
         document_chunk = DocumentChunk(
             chunk_id=f"chunk_{uuid.uuid4().hex[:12]}",
             parent_doc_id=course_id,
             chunk_text=chunk,
             chunk_order=index,
             page_ref=None,
-            embedding=embedding.tolist(),
+            embedding=None,
         )
 
         db.add(document_chunk)
 
-    # Save everything to PostgreSQL
+    # Save course and chunks first
     db.commit()
     db.refresh(course)
 
+    # Queue embedding task in Celery
+    task = embed_course_task.delay(course_id)
+
     return {
-        "message": "Course uploaded, processed, and embedded successfully",
+        "message": "Course uploaded and embedding task queued successfully",
         "course_id": course.course_id,
         "file_path": object_name,
         "domain_tag": domain_tag,
         "chunks_created": len(chunks),
-        "embeddings_created": len(embeddings),
+        "task_id": task.id,
+        "task_status": "queued",
     }
