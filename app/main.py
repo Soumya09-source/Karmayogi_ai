@@ -8,6 +8,7 @@ app.include_router(auth.router)
 app.include_router(assessments.router)
 app.include_router(behavioural.router)
 app.include_router(recommendations.router)
+
 @app.get("/health")
 def health():
     return {"status": "ok"}

@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, Column, Integer, Numeric, String, Text
+from sqlalchemy import Boolean, Column, Index, Integer, Numeric, String, Text
 from pgvector.sqlalchemy import Vector
 
 from app.db import Base
@@ -25,3 +25,11 @@ class Course(Base):
     embedding_text = Column(Text)
     embedding_text_is_description_based = Column(Boolean)
     embedding = Column(Vector(384))
+    __table_args__ = (
+        Index(
+            "idx_courses_embedding",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+    )
