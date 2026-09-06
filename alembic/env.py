@@ -26,6 +26,8 @@ from app.models.assessment_history import AssessmentHistory
 from app.models.concept_mastery import ConceptMastery
 
 from app.models.recommendation import Recommendation
+from app.models.concept_review_queue import ConceptReviewQueue
+from app.models.mcq_generation_log import McqGenerationLog
 
 
 # this is the Alembic Config object, which provides
