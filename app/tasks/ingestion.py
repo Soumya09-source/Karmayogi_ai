@@ -62,3 +62,12 @@ def generate_mcqs_task(doc_id: str):
         "doc_id": doc_id,
         "message": "MCQ generation task executed",
     }
+@celery_app.task
+def notify_high_priority_flag_task(mcq_id: str):
+    print(f"NOTIFICATION: MCQ {mcq_id} has been flagged as high priority.")
+
+    return {
+        "status": "completed",
+        "mcq_id": mcq_id,
+        "message": "High-priority MCQ notification sent",
+    }

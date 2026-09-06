@@ -35,3 +35,4 @@ class MCQ(Base):
 
     times_served = Column(Integer, nullable=False, default=0)
     times_correct = Column(Integer, nullable=False, default=0)
+    flag_count = Column(Integer, nullable=False, default=0)
