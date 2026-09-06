@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, Column, String, Text
+from sqlalchemy import Boolean, Column, Index, String, Text
 from pgvector.sqlalchemy import Vector
 
 from app.db import Base
@@ -18,3 +18,11 @@ class ConceptTaxonomy(Base):
     is_canonical_label = Column(Boolean)
     embedding_text = Column(Text)
     embedding = Column(Vector(384))
+    __table_args__ = (
+        Index(
+            "idx_concept_taxonomy_embedding",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+    )
