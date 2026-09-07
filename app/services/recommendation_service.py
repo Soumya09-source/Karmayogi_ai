@@ -1,4 +1,3 @@
-import random
 import numpy as np
 from sqlalchemy.orm import Session
 
@@ -183,14 +182,11 @@ def generate_recommendations(
     top_n: int = 5
 ):
     """
-    Generate and save course recommendations for an employee.
-
-    Uses:
-    - Real BKT concept mastery data
-    - Real courses from the database
-    - Temporary random similarity scores
-    """
-
+Uses:
+- Real BKT concept mastery data
+- Real courses from the database
+- Real embedding-based cosine similarity scores
+"""
     gap_concepts = get_gap_concepts(
         db=db,
         employee_id=employee_id
