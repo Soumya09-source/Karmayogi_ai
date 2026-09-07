@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 from app.db import get_db
 from app.models.recommendation import Recommendation
 from app.schemas.recommendation import RecommendationResponse
+from app.services.recommendation_service import generate_recommendations
 
 
 router = APIRouter(
@@ -26,5 +27,12 @@ def get_recommendations(
         .order_by(Recommendation.similarity_score.desc())
         .all()
     )
+
+    # Generate recommendations automatically if none exist
+    if not recommendations:
+        recommendations = generate_recommendations(
+            db=db,
+            employee_id=employee_id
+        )
 
     return recommendations
