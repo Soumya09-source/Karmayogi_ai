@@ -10,6 +10,7 @@ class MCQ(Base):
     __tablename__ = "mcqs"
 
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    question = Column(Text, nullable=False)
     concept_id = Column(
         String,
         ForeignKey("concept_taxonomy.canonical_concept_id"),
