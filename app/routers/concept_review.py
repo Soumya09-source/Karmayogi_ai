@@ -8,6 +8,7 @@ from app.core.deps import require_role
 from app.db import get_db
 from app.models.concept import ConceptTaxonomy
 from app.models.concept_review_queue import ConceptReviewQueue
+from app.services.embedding_service import embed_texts_for_app
 
 
 router = APIRouter(
@@ -58,12 +59,16 @@ def approve_concept(
 
     concept_id = f"CC-{uuid.uuid4().hex[:8]}"
 
+    embedding_text = canonical_name
+    embedding = embed_texts_for_app([embedding_text])[0]
+
     new_concept = ConceptTaxonomy(
         canonical_concept_id=concept_id,
         canonical_concept_name=canonical_name,
         raw_concept_name=item.raw_concept_name,
         parent_domain=domain,
-        embedding_text=canonical_name,
+        embedding_text=embedding_text,
+        embedding=embedding,
     )
 
     db.add(new_concept)
