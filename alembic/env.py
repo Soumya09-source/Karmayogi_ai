@@ -17,6 +17,7 @@ from app.models.user import User
 from app.models.concept import ConceptTaxonomy
 from app.models.course import Course
 from app.models.document_chunk import DocumentChunk, ChunkDomainTag
+from app.models.document import Document
 
 from app.models.employee_profile import EmployeeProfile
 from app.models.employee_training_history import EmployeeTrainingHistory
@@ -28,6 +29,10 @@ from app.models.concept_mastery import ConceptMastery
 from app.models.recommendation import Recommendation
 from app.models.concept_review_queue import ConceptReviewQueue
 from app.models.mcq_generation_log import McqGenerationLog
+
+from app.models.behavioural_rating import BehaviouralRating
+from app.models.mcq_flag import MCQFlag
+from app.models.mcq_review import MCQReview
 
 
 # this is the Alembic Config object, which provides
