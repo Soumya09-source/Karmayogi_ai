@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.models.mcq import MCQ
+from app.models.assessment_history import AssessmentHistory
 from app.services import bkt
 
 router = APIRouter(prefix="/assessments", tags=["assessments"])
@@ -101,3 +102,12 @@ def submit_answer(
         "correct": correct,
         "mastery": new_mastery,
     }
+
+@router.get("/history/{employee_id}")
+def get_history(employee_id: str, db: Session = Depends(get_db)):
+    return (
+        db.query(AssessmentHistory)
+        .filter(AssessmentHistory.employee_id == employee_id)
+        .order_by(AssessmentHistory.timestamp.desc())
+        .all()
+    )

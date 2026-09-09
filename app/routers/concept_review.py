@@ -59,16 +59,16 @@ def approve_concept(
 
     concept_id = f"CC-{uuid.uuid4().hex[:8]}"
 
-    embedding_text = canonical_name
-    embedding = embed_texts_for_app([embedding_text])[0]
+    # Generate embedding for the newly approved concept
+    embedding = embed_texts_for_app([canonical_name])[0]
 
     new_concept = ConceptTaxonomy(
         canonical_concept_id=concept_id,
         canonical_concept_name=canonical_name,
         raw_concept_name=item.raw_concept_name,
         parent_domain=domain,
-        embedding_text=embedding_text,
-        embedding=embedding,
+        embedding_text=canonical_name,
+        embedding=embedding.tolist(),
     )
 
     db.add(new_concept)
