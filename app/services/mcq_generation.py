@@ -2,26 +2,15 @@
 MCQ generation pipeline.
 
 Per chunk:
-  1. Extract candidate concepts (Ollama, JSON mode).
-  2. Match each against concept_taxonomy via embedding similarity.
-       - confident match  -> use that canonical_concept_id
-       - no confident match -> log to concept_review_queue, skip generation
-         for that concept (never auto-create a new canonical concept)
-  3. For each matched concept, generate a difficulty-varied batch of MCQs
-     sized by the LLM's own "breadth" rating of the concept.
-  4. Run a self-consistency check per MCQ (independent re-derivation of the
-     answer from the same chunk) and store the resulting confidence_score.
-  5. Insert MCQs with status="live" — no pre-publish gate, per the
-     reactive-flagging design already used elsewhere in this project.
-
-No table is ever wiped or overwritten here — everything is a fresh INSERT
-with a new UUID, so this is safe to run repeatedly and safe to run
-alongside any pre-existing seeded/manual rows in `mcqs`.
+  1. Extract candidate concepts.
+  2. Match each concept against concept_taxonomy.
+  3. Generate difficulty-varied MCQs.
+  4. Validate generated MCQs for quality.
+  5. Run self-consistency checking.
+  6. Insert valid MCQs into the database.
 """
 
-from __future__ import annotations  # keeps `str | None` style hints safe on
-                                     # Python <3.10 too, since annotations
-                                     # are then never evaluated at import time
+from __future__ import annotations
 
 import logging
 import re
@@ -40,32 +29,30 @@ from app.models.mcq import MCQ
 from app.models.mcq_generation_log import McqGenerationLog
 from app.services import ollama_client
 
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Same embedding model used in embed_and_load.py — MUST match, since we're
-# comparing against vectors already stored via that model. Using a
-# different model here would make similarity scores meaningless.
+
+# ---------------------------------------------------------------------
+# Utility: normalize Ollama output
+# ---------------------------------------------------------------------
+
 def _coerce_to_list(result, context: str) -> list:
     """
-    Ollama's format="json" guarantees valid JSON, but not the requested
-    SHAPE — local models frequently wrap a requested array in an object
-    (e.g. {"concepts": [...]}) or, when there's only one item, return that
-    one item as a bare object instead of a single-element array. This
-    normalizes the common real-world variations instead of failing on them.
+    Convert common Ollama JSON response shapes into a list.
     """
+
     if isinstance(result, list):
         return result
 
     if isinstance(result, dict):
-        # a single-item result returned as a bare object, e.g.
-        # {"name": "...", "suggested_domain": "...", "breadth": "..."}
-        # or {"question": "...", "options": [...], ...}
+
+        # Single object
         if any(k in result for k in ("name", "question")):
             return [result]
 
-        # wrapped under a key, e.g. {"concepts": [...]} or {"mcqs": [...]}
-        # or {"questions": [...]} — take the first list-valued key found
+        # Wrapped list
         for value in result.values():
             if isinstance(value, list):
                 return value
@@ -74,15 +61,23 @@ def _coerce_to_list(result, context: str) -> list:
         f"Could not coerce Ollama's {context} output into a list. "
         f"Got: {type(result)} -> {str(result)[:300]}"
     )
+
+
+# ---------------------------------------------------------------------
+# MCQ normalization
+# ---------------------------------------------------------------------
+
 def normalize_mcq(mcq: dict) -> dict:
     """
-    Normalize an LLM-generated MCQ into a consistent format.
+    Normalize an LLM-generated MCQ.
 
     Requirements:
-    - Exactly 4 options
-    - Option IDs must be a, b, c, d
-    - correct_option_id must be one of a, b, c, d
-    - correct_option_id must match an existing option
+    - exactly 4 options
+    - option IDs a/b/c/d
+    - unique option IDs
+    - unique option text
+    - valid correct option
+    - non-empty question
     """
 
     if not isinstance(mcq, dict):
@@ -98,7 +93,6 @@ def normalize_mcq(mcq: dict) -> dict:
             f"MCQ must have exactly 4 options, got {len(options)}"
         )
 
-    # Map numeric IDs and letter IDs to the standard a/b/c/d format.
     id_map = {
         "1": "a",
         "2": "b",
@@ -126,13 +120,12 @@ def normalize_mcq(mcq: dict) -> dict:
                 f"Option {index + 1} has empty text"
             )
 
-        raw_id = str(option.get("id", "")).strip().lower()
+        raw_id = str(
+            option.get("id", "")
+        ).strip().lower()
 
-        # Remove accidental punctuation such as ":1", "1)", "a.", etc.
         cleaned_id = raw_id.strip(":.) ")
 
-        # If the model produced a valid numeric/letter ID, map it.
-        # Otherwise fall back to the option's position.
         if cleaned_id in id_map:
             normalized_id = id_map[cleaned_id]
         else:
@@ -145,15 +138,19 @@ def normalize_mcq(mcq: dict) -> dict:
             }
         )
 
-    # Normalize the correct answer.
+    # ---------------------------------------------------------
+    # Normalize correct answer
+    # ---------------------------------------------------------
+
     raw_correct_id = mcq.get("correct_option_id")
 
     if raw_correct_id is None:
         raise ValueError("Missing correct_option_id")
 
-    correct_id = str(raw_correct_id).strip().lower()
+    correct_id = str(
+        raw_correct_id
+    ).strip().lower()
 
-    # Remove accidental punctuation.
     correct_id = correct_id.strip(":.) ")
 
     if correct_id not in id_map:
@@ -163,22 +160,48 @@ def normalize_mcq(mcq: dict) -> dict:
 
     correct_id = id_map[correct_id]
 
-    # Make sure all option IDs are unique.
-    option_ids = [option["id"] for option in normalized_options]
+    # ---------------------------------------------------------
+    # Check option IDs
+    # ---------------------------------------------------------
+
+    option_ids = [
+        option["id"]
+        for option in normalized_options
+    ]
 
     if len(set(option_ids)) != 4:
         raise ValueError(
             f"Duplicate option IDs after normalization: {option_ids}"
         )
 
-    # Make sure the correct answer actually exists.
+    # ---------------------------------------------------------
+    # Check duplicate option text
+    # ---------------------------------------------------------
+
+    option_texts = [
+        option["text"].strip().casefold()
+        for option in normalized_options
+    ]
+
+    if len(set(option_texts)) != 4:
+        raise ValueError(
+            "Duplicate option text detected"
+        )
+
+    # ---------------------------------------------------------
+    # Check correct answer exists
+    # ---------------------------------------------------------
+
     if correct_id not in option_ids:
         raise ValueError(
             f"correct_option_id '{correct_id}' does not match "
             f"any option: {option_ids}"
         )
 
-    # Basic question validation.
+    # ---------------------------------------------------------
+    # Check question
+    # ---------------------------------------------------------
+
     question = mcq.get("question")
 
     if not question or not str(question).strip():
@@ -190,133 +213,350 @@ def normalize_mcq(mcq: dict) -> dict:
 
     return mcq
 
+
+# ---------------------------------------------------------------------
+# Quality validation
+# ---------------------------------------------------------------------
+
+def has_answer_length_bias(
+    mcq: dict,
+    ratio: float = 1.8
+) -> bool:
+    """
+    Detect whether the correct answer is suspiciously longer
+    or shorter than the distractors.
+    """
+
+    options = mcq["options"]
+    correct_id = mcq["correct_option_id"]
+
+    correct_text = next(
+        option["text"]
+        for option in options
+        if option["id"] == correct_id
+    )
+
+    distractors = [
+        option["text"]
+        for option in options
+        if option["id"] != correct_id
+    ]
+
+    correct_length = len(
+        correct_text.strip()
+    )
+
+    distractor_lengths = [
+        len(text.strip())
+        for text in distractors
+    ]
+
+    if not distractor_lengths:
+        return True
+
+    average_distractor_length = (
+        sum(distractor_lengths)
+        / len(distractor_lengths)
+    )
+
+    if average_distractor_length == 0:
+        return True
+
+    return (
+        correct_length >= ratio * average_distractor_length
+        or
+        correct_length <= average_distractor_length / ratio
+    )
+
+
+def validate_mcq_quality(
+    mcq: dict
+) -> tuple[bool, str]:
+    """
+    Run automated quality checks.
+
+    Returns:
+        (True, "") when valid.
+        (False, reason) when invalid.
+    """
+
+    options = mcq.get("options", [])
+
+    # Must have exactly 4 options
+    if len(options) != 4:
+        return False, "MCQ must have exactly 4 options"
+
+    # Extract and normalize option text
+    option_texts = [
+        str(option.get("text", "")).strip().casefold()
+        for option in options
+    ]
+
+    # No option should be empty
+    if any(not text for text in option_texts):
+        return False, "MCQ contains an empty option"
+
+    # Reject duplicate option text
+    if len(set(option_texts)) != len(option_texts):
+        return False, "duplicate option text"
+
+    # Reject suspicious correct-answer length bias
+    if has_answer_length_bias(mcq):
+        return (
+            False,
+            "correct answer has suspicious length bias"
+        )
+
+    return True, ""
+
+def validate_mcq_relevance(
+    mcq: dict,
+    chunk_text: str,
+    concept_name: str,
+    min_keyword_overlap: int = 1,
+) -> tuple[bool, str]:
+    """
+    Check whether the MCQ question meaningfully relates to the
+    source chunk and target concept using basic keyword overlap.
+
+    Returns:
+        (True, "") when relevant.
+        (False, reason) when insufficient overlap is found.
+    """
+
+    question = str(mcq.get("question", "")).strip()
+
+    if not question:
+        return False, "question is empty"
+
+    # Extract keywords separately.
+    question_words = set(
+        re.findall(
+            r"\b[a-zA-Z][a-zA-Z0-9-]*\b",
+            question.casefold()
+        )
+    )
+
+    source_words = set(
+        re.findall(
+            r"\b[a-zA-Z][a-zA-Z0-9-]*\b",
+            chunk_text.casefold()
+        )
+    )
+
+    concept_words = set(
+        re.findall(
+            r"\b[a-zA-Z][a-zA-Z0-9-]*\b",
+            concept_name.casefold()
+        )
+    )
+
+    stop_words = {
+        "a", "an", "the", "is", "are", "was", "were",
+        "what", "which", "who", "when", "where", "why",
+        "how", "does", "do", "did", "can", "could",
+        "would", "should", "of", "to", "in", "on", "for",
+        "from", "with", "and", "or", "as", "by", "be",
+        "this", "that", "these", "those", "it", "its",
+        "used", "use", "using", "method", "methods"
+    }
+
+    def meaningful_words(words: set[str]) -> set[str]:
+        return {
+            word
+            for word in words
+            if word not in stop_words and len(word) >= 4
+        }
+
+    question_keywords = meaningful_words(question_words)
+    source_keywords = meaningful_words(source_words)
+    concept_keywords = meaningful_words(concept_words)
+
+    # The question must overlap with the source.
+    source_overlap = question_keywords & source_keywords
+
+    # It must also overlap with the concept when the concept
+    # contains meaningful terms.
+    concept_overlap = question_keywords & concept_keywords
+
+    if len(source_overlap) < min_keyword_overlap:
+        return (
+            False,
+            f"insufficient source overlap: {sorted(source_overlap)}"
+        )
+
+    # If the concept has meaningful words, require at least
+    # one concept-related keyword OR multiple source keywords.
+    if concept_keywords and not concept_overlap and len(source_overlap) < 2:
+        return (
+            False,
+            f"insufficient concept relevance: {sorted(concept_overlap)}"
+        )
+
+    return True, ""
+# ---------------------------------------------------------------------
+# Embedding model
+# ---------------------------------------------------------------------
+
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
-_embedding_model = None  # lazy-loaded singleton, avoid reloading per call
+
+_embedding_model = None
 
 
 def get_embedding_model() -> SentenceTransformer:
     global _embedding_model
+
     if _embedding_model is None:
-        logger.info("Loading embedding model: %s", EMBEDDING_MODEL_NAME)
-        _embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+        logger.info(
+            "Loading embedding model: %s",
+            EMBEDDING_MODEL_NAME
+        )
+
+        _embedding_model = SentenceTransformer(
+            EMBEDDING_MODEL_NAME
+        )
+
     return _embedding_model
 
 
-# Confidence threshold for concept matching against concept_taxonomy.
-# Cosine similarity, not distance (higher = more similar). Calibrated
-# empirically against real extraction output (not a guess): with the
-# domain-enriched query text above, genuine matches (e.g. "GDP Base Year"
-# -> GDP) should land meaningfully higher than true non-matches (e.g.
-# "Publicity Activities", which scored ~0.22 with the bare-name query and
-# has no real counterpart in the taxonomy). Re-check this value against a
-# larger sample once more chunks have run — this is a starting point, not
-# a final answer.
+# ---------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------
+
 CONFIDENT_MATCH_THRESHOLD = 0.55
 
-# Breadth rating (from the LLM's own extraction pass) -> how many MCQs to
-# generate and how they should be split across difficulty levels. This is
-# a heuristic, not a precise science — a concept the LLM judges "broad"
-# (e.g. "National Accounts Statistics") reasonably warrants more coverage
-# than a narrow one (e.g. "4th Economic Census").
 MCQ_PLAN_BY_BREADTH = {
-    "simple":   {"easy": 2, "medium": 2, "hard": 1},   # 5 total
-    "moderate": {"easy": 3, "medium": 3, "hard": 2},   # 8 total
-    "broad":    {"easy": 4, "medium": 5, "hard": 3},   # 12 total
+    "simple": {
+        "easy": 2,
+        "medium": 2,
+        "hard": 1,
+    },
+    "moderate": {
+        "easy": 3,
+        "medium": 3,
+        "hard": 2,
+    },
+    "broad": {
+        "easy": 4,
+        "medium": 5,
+        "hard": 3,
+    },
 }
-DEFAULT_BREADTH = "moderate"  # fallback if the LLM omits/mis-formats this field
+
+DEFAULT_BREADTH = "moderate"
 
 
 # ---------------------------------------------------------------------
-# Step 1: concept extraction
+# Step 1: Concept extraction
 # ---------------------------------------------------------------------
 
-def extract_concepts_from_chunk(chunk_text: str) -> list[dict]:
+def extract_concepts_from_chunk(
+    chunk_text: str
+) -> list[dict]:
     """
-    Returns a list of dicts: [{"name": str, "suggested_domain": str,
-    "breadth": "simple"|"moderate"|"broad"}, ...]
-
-    Ollama is prompted to return ONLY JSON. Malformed output is caught by
-    ollama_client.generate_json and re-raised as ValueError — callers
-    should catch and log-and-skip rather than crash the whole batch run.
+    Extract concepts from a document chunk.
     """
-    prompt = f"""You are analyzing a passage from an official Indian government
-statistics training/methodology document. Identify the distinct statistical,
-technical, or governance CONCEPTS this passage teaches or explains.
 
-Return ONLY a JSON array, no other text, in this exact shape:
-[
-  {{"name": "<short concept name, 2-6 words>", "suggested_domain": "<one of: Statistical, Technical, Digital Governance, Behavioural & Managerial, Administrative/Governance>", "breadth": "<simple|moderate|broad>"}}
-]
+    prompt = f"""
+You are analyzing a passage from an official Indian government
+statistics training/methodology document.
 
-"breadth" means: "simple" = one narrow fact/definition, "moderate" = a
-standard topic with a few sub-aspects, "broad" = a wide topic covering many
-sub-topics. If the passage covers no clear teachable concept (e.g. it's a
-title page, table of contents, or pure boilerplate), return an empty array [].
+Identify the distinct statistical, technical, or governance
+CONCEPTS this passage teaches or explains.
+
+Return ONLY a JSON array.
+
+Each item must have:
+
+{{
+    "name": "<short concept name, 2-6 words>",
+    "suggested_domain": "<one of: Statistical, Technical, Digital Governance, Behavioural & Managerial, Administrative/Governance>",
+    "breadth": "<simple|moderate|broad>"
+}}
+
+Breadth means:
+
+simple = one narrow fact or definition
+moderate = a standard topic with a few sub-aspects
+broad = a wide topic covering many sub-topics
+
+If there is no clear teachable concept, return [].
 
 Passage:
+
 \"\"\"{chunk_text}\"\"\"
 """
+
     result = ollama_client.generate_json(prompt)
-    return _coerce_to_list(result, context="concept extraction")
+
+    return _coerce_to_list(
+        result,
+        context="concept extraction"
+    )
 
 
 # ---------------------------------------------------------------------
-# Step 2: match extracted concept against concept_taxonomy
+# Step 2: Match concept to taxonomy
 # ---------------------------------------------------------------------
+
 def match_concept_to_taxonomy(
-    db: Session, raw_concept_name: str, suggested_domain: str | None = None
+    db: Session,
+    raw_concept_name: str,
+    suggested_domain: str | None = None
 ) -> tuple[str | None, float]:
     """
     Match an extracted concept to the canonical taxonomy.
-
-    Matching strategy:
-    1. Exact canonical concept / alias match -> accept immediately.
-    2. Otherwise use embedding similarity.
-    3. Only accept a semantic match when similarity is very strong.
-    4. Otherwise return None so the caller can send the concept
-       to the concept review queue.
-
-    This prevents broad or unrelated concepts from being silently
-    mapped to the nearest available taxonomy concept.
     """
-    normalized_name = raw_concept_name.strip().casefold()
 
-    # ---------------------------------------------------------
-    # 1. Exact canonical-name or alias-name match
-    # ---------------------------------------------------------
     exact_match = (
         db.query(ConceptTaxonomy)
         .filter(
-            (ConceptTaxonomy.canonical_concept_name.ilike(raw_concept_name.strip()))
-            | (ConceptTaxonomy.alias_name.ilike(raw_concept_name.strip()))
+            (
+                ConceptTaxonomy.canonical_concept_name.ilike(
+                    raw_concept_name.strip()
+                )
+            )
+            |
+            (
+                ConceptTaxonomy.alias_name.ilike(
+                    raw_concept_name.strip()
+                )
+            )
         )
         .first()
     )
 
     if exact_match:
-        return exact_match.canonical_concept_id, 1.0
+        return (
+            exact_match.canonical_concept_id,
+            1.0
+        )
 
-    # ---------------------------------------------------------
-    # 2. Semantic embedding match
-    # ---------------------------------------------------------
     model = get_embedding_model()
 
     query_text = raw_concept_name.strip()
 
     if suggested_domain:
-        query_text = f"{raw_concept_name.strip()}. Domain: {suggested_domain}."
+        query_text = (
+            f"{raw_concept_name.strip()}. "
+            f"Domain: {suggested_domain}."
+        )
 
     query_vector = model.encode(
         query_text,
-        normalize_embeddings=True,
+        normalize_embeddings=True
     ).tolist()
 
     best = (
         db.query(
             ConceptTaxonomy.canonical_concept_id,
-            ConceptTaxonomy.embedding.cosine_distance(query_vector).label("distance"),
+            ConceptTaxonomy.embedding.cosine_distance(
+                query_vector
+            ).label("distance"),
         )
-        .filter(ConceptTaxonomy.embedding.isnot(None))
+        .filter(
+            ConceptTaxonomy.embedding.isnot(None)
+        )
         .order_by("distance")
         .first()
     )
@@ -325,20 +565,23 @@ def match_concept_to_taxonomy(
         return None, 0.0
 
     canonical_concept_id, distance = best
+
     similarity = 1 - distance
 
-    # ---------------------------------------------------------
-    # 3. Conservative semantic matching
-    # ---------------------------------------------------------
-    SEMANTIC_MATCH_THRESHOLD = 0.80
+    semantic_threshold = 0.80
 
-    if similarity >= SEMANTIC_MATCH_THRESHOLD:
-        return canonical_concept_id, similarity
+    if similarity >= semantic_threshold:
+        return (
+            canonical_concept_id,
+            similarity
+        )
 
-    # ---------------------------------------------------------
-    # 4. Uncertain match -> caller sends to review queue
-    # ---------------------------------------------------------
     return None, similarity
+
+
+# ---------------------------------------------------------------------
+# Concept review queue
+# ---------------------------------------------------------------------
 
 def flag_for_review(
     db: Session,
@@ -348,6 +591,10 @@ def flag_for_review(
     best_match_concept_id: str | None = None,
     best_match_score: float | None = None,
 ):
+    """
+    Add an uncertain concept to the review queue.
+    """
+
     review_item = ConceptReviewQueue(
         raw_concept_name=raw_concept_name,
         suggested_domain=suggested_domain,
@@ -362,8 +609,9 @@ def flag_for_review(
 
     return review_item
 
+
 # ---------------------------------------------------------------------
-# Step 3: generate MCQs for a matched concept
+# Step 3: Generate one MCQ
 # ---------------------------------------------------------------------
 
 def generate_single_mcq(
@@ -372,53 +620,57 @@ def generate_single_mcq(
     difficulty: str
 ) -> dict:
     """
-    Fallback path: generates exactly ONE MCQ at the given difficulty.
-
-    The generated MCQ is normalized before being returned so that
-    option IDs are always a/b/c/d.
+    Generate exactly one MCQ.
     """
 
-    prompt = f"""You are writing ONE multiple-choice question for a training
-platform for Indian government statistical officers, based STRICTLY on the
-passage below.
+    prompt = f"""
+You are writing ONE multiple-choice question for a training
+platform for Indian government statistical officers.
 
-Do not introduce facts not present in or directly implied by the passage.
+Base the question STRICTLY on the passage below.
 
-Concept being tested: "{concept_name}"
+Do not introduce facts not present in or directly implied by
+the passage.
 
-Required difficulty: "{difficulty}"
+Concept being tested:
+"{concept_name}"
+
+Required difficulty:
+"{difficulty}"
 
 Write exactly ONE question with:
 
 - exactly 4 options
 - exactly one correct answer
 - one-sentence explanation
-- option IDs MUST be exactly "a", "b", "c", "d"
-- correct_option_id MUST be exactly one of "a", "b", "c", "d"
+- option IDs exactly "a", "b", "c", "d"
+- correct_option_id exactly one of "a", "b", "c", "d"
 
-Do NOT use numeric option IDs such as 1, 2, 3, 4.
-Do NOT add punctuation to option IDs.
+Do NOT use numeric option IDs.
 
-Return ONLY a single JSON object in this exact shape:
+Return ONLY this JSON structure:
 
 {{
-  "question": "...",
-  "options": [
-    {{"id": "a", "text": "..."}},
-    {{"id": "b", "text": "..."}},
-    {{"id": "c", "text": "..."}},
-    {{"id": "d", "text": "..."}}
-  ],
-  "correct_option_id": "a",
-  "explanation": "...",
-  "difficulty": "{difficulty}"
+    "question": "...",
+    "options": [
+        {{"id": "a", "text": "..."}},
+        {{"id": "b", "text": "..."}},
+        {{"id": "c", "text": "..."}},
+        {{"id": "d", "text": "..."}}
+    ],
+    "correct_option_id": "a",
+    "explanation": "...",
+    "difficulty": "{difficulty}"
 }}
 
 Passage:
+
 \"\"\"{chunk_text}\"\"\"
 """
 
-    result = ollama_client.generate_json(prompt)
+    result = ollama_client.generate_json(
+        prompt
+    )
 
     if isinstance(result, list):
         result = result[0] if result else {}
@@ -430,11 +682,49 @@ Passage:
 
     result["difficulty"] = difficulty
 
-    # Normalize and validate the generated MCQ.
     result = normalize_mcq(result)
 
     return result
 
+
+# ---------------------------------------------------------------------
+# Duplicate question detection
+# ---------------------------------------------------------------------
+
+def is_duplicate_question(
+    question: str,
+    existing_questions: list[str],
+    threshold: float = 0.85
+) -> bool:
+    """
+    Detect exact or near-duplicate questions.
+    """
+
+    normalized_question = " ".join(
+        question.lower().split()
+    )
+
+    for existing in existing_questions:
+
+        normalized_existing = " ".join(
+            existing.lower().split()
+        )
+
+        similarity = SequenceMatcher(
+            None,
+            normalized_question,
+            normalized_existing
+        ).ratio()
+
+        if similarity >= threshold:
+            return True
+
+    return False
+
+
+# ---------------------------------------------------------------------
+# Generate MCQs for concept
+# ---------------------------------------------------------------------
 
 def generate_mcqs_for_concept(
     chunk_text: str,
@@ -442,15 +732,13 @@ def generate_mcqs_for_concept(
     breadth: str
 ) -> list[dict]:
     """
-    Generate a difficulty-varied batch of MCQs for a concept.
+    Generate difficulty-varied MCQs for a concept.
 
-    Primary path:
-        One schema-constrained Ollama call per difficulty.
-
-    Fallback:
-        Generate missing questions one at a time.
-
-    Every MCQ is normalized and validated before being returned.
+    Every MCQ is:
+    - normalized
+    - checked for duplicate options
+    - checked for answer-length bias
+    - checked for duplicate questions
     """
 
     plan = MCQ_PLAN_BY_BREADTH.get(
@@ -465,13 +753,14 @@ def generate_mcqs_for_concept(
         if count == 0:
             continue
 
-        prompt = f"""You are writing multiple-choice questions for a training
+        prompt = f"""
+You are writing multiple-choice questions for a training
 platform for Indian government statistical officers.
 
 Base the questions STRICTLY on the passage below.
 
-Do not introduce facts that are not present in or directly implied by
-the passage.
+Do not introduce facts that are not present in or directly
+implied by the passage.
 
 Concept being tested:
 "{concept_name}"
@@ -490,32 +779,47 @@ Each question must:
 5. Have a concise one-sentence explanation.
 6. Be answerable using the supplied passage.
 
-IMPORTANT OPTION FORMAT:
+IMPORTANT:
 
-Every option ID MUST be exactly one of:
+Every option ID MUST be exactly:
 
-"a", "b", "c", "d"
+"a"
+"b"
+"c"
+"d"
 
 Use each option ID exactly once.
 
-The correct_option_id MUST be exactly one of:
+The correct_option_id must also be one of:
 
-"a", "b", "c", "d"
+"a"
+"b"
+"c"
+"d"
 
-Do NOT use numeric IDs such as:
-"1", "2", "3", "4"
+Do NOT use numeric IDs.
 
 Do NOT use punctuation in option IDs.
 
-Return the questions in JSON format compatible with the supplied schema.
+Do NOT make the correct answer obviously longer than the
+distractors.
+
+Return ONLY valid JSON compatible with the supplied schema.
 
 Passage:
+
 \"\"\"{chunk_text}\"\"\"
 """
 
+        # ---------------------------------------------------------
+        # Generate batch
+        # ---------------------------------------------------------
+
         try:
 
-            schema = ollama_client.mcq_array_schema(count)
+            schema = ollama_client.mcq_array_schema(
+                count
+            )
 
             result = ollama_client.generate_json(
                 prompt,
@@ -530,9 +834,9 @@ Passage:
         except Exception as e:
 
             logger.warning(
-                "Concept '%s' (%s): schema-constrained batch "
-                "call failed: %s. Falling back to one-at-a-time "
-                "generation for this difficulty.",
+                "Concept '%s' (%s): schema-constrained "
+                "batch call failed: %s. Falling back "
+                "to one-at-a-time generation.",
                 concept_name,
                 difficulty,
                 e,
@@ -540,17 +844,73 @@ Passage:
 
             batch = []
 
+        # ---------------------------------------------------------
+        # Validate batch MCQs
+        # ---------------------------------------------------------
+
         valid_batch_count = 0
 
-        # Normalize and validate every generated MCQ.
         for mcq in batch:
 
             try:
 
                 mcq = normalize_mcq(mcq)
 
-                # Never trust the model's difficulty field.
+                # Never trust model difficulty
                 mcq["difficulty"] = difficulty
+
+                # Quality validation
+                quality_ok, quality_reason = (
+                    validate_mcq_quality(mcq)
+                )
+
+                if not quality_ok:
+
+                    logger.warning(
+                        "Concept '%s' (%s): rejecting "
+                        "low-quality MCQ: %s",
+                        concept_name,
+                        difficulty,
+                        quality_reason,
+                    )
+
+                    continue
+                relevance_ok, relevance_reason = validate_mcq_relevance(
+                    mcq,
+                    chunk_text,
+                    concept_name,
+                )
+
+                if not relevance_ok:
+                    logger.warning(
+                        "Concept '%s' (%s): rejecting "
+                        "irrelevant MCQ: %s",
+                        concept_name,
+                        difficulty,
+                        relevance_reason,
+                    )
+                    continue
+
+                # Duplicate question check
+                existing_questions = [
+                    item["question"]
+                    for item in all_mcqs
+                ]
+
+                if is_duplicate_question(
+                    mcq["question"],
+                    existing_questions
+                ):
+
+                    logger.warning(
+                        "Concept '%s' (%s): rejecting "
+                        "duplicate/near-duplicate MCQ: %s",
+                        concept_name,
+                        difficulty,
+                        mcq["question"],
+                    )
+
+                    continue
 
                 all_mcqs.append(mcq)
 
@@ -566,7 +926,10 @@ Passage:
                     e,
                 )
 
-        # Generate missing questions individually.
+        # ---------------------------------------------------------
+        # Fallback generation
+        # ---------------------------------------------------------
+
         shortfall = count - valid_batch_count
 
         if shortfall > 0:
@@ -581,7 +944,18 @@ Passage:
                 shortfall,
             )
 
-            for _ in range(shortfall):
+            attempts = 0
+            max_attempts = shortfall * 3
+
+            while (
+                len([
+                    m for m in all_mcqs
+                    if m["difficulty"] == difficulty
+                ]) < count
+                and attempts < max_attempts
+            ):
+
+                attempts += 1
 
                 try:
 
@@ -590,6 +964,59 @@ Passage:
                         concept_name,
                         difficulty
                     )
+
+                    # Quality validation
+                    quality_ok, quality_reason = (
+                        validate_mcq_quality(mcq)
+                    )
+
+                    if not quality_ok:
+
+                        logger.warning(
+                            "Concept '%s' (%s): rejecting "
+                            "low-quality fallback MCQ: %s",
+                            concept_name,
+                            difficulty,
+                            quality_reason,
+                        )
+
+                        continue
+                                            # Source/concept relevance check
+                    relevance_ok, relevance_reason = validate_mcq_relevance(
+                        mcq,
+                        chunk_text,
+                        concept_name,
+                    )
+
+                    if not relevance_ok:
+                        logger.warning(
+                            "Concept '%s' (%s): rejecting "
+                            "irrelevant fallback MCQ: %s",
+                            concept_name,
+                            difficulty,
+                            relevance_reason,
+                        )
+                        continue
+                    # Duplicate question validation
+                    existing_questions = [
+                        item["question"]
+                        for item in all_mcqs
+                    ]
+
+                    if is_duplicate_question(
+                        mcq["question"],
+                        existing_questions
+                    ):
+
+                        logger.warning(
+                            "Concept '%s' (%s): rejecting "
+                            "duplicate fallback MCQ: %s",
+                            concept_name,
+                            difficulty,
+                            mcq["question"],
+                        )
+
+                        continue
 
                     all_mcqs.append(mcq)
 
@@ -607,7 +1034,7 @@ Passage:
 
 
 # ---------------------------------------------------------------------
-# Step 4: self-consistency confidence check
+# Step 4: Self-consistency check
 # ---------------------------------------------------------------------
 
 def self_consistency_check(
@@ -615,11 +1042,11 @@ def self_consistency_check(
     chunk_text: str
 ) -> float:
     """
-    Independently re-derives the answer from the source passage.
+    Independently verify the generated answer.
 
     Returns:
-        1.0 -> re-derived answer matches the generated answer
-        0.0 -> answer disagrees or could not be parsed
+        1.0 -> answer matches
+        0.0 -> answer disagrees or cannot be parsed
     """
 
     options_text = "\n".join(
@@ -627,27 +1054,31 @@ def self_consistency_check(
         for opt in mcq["options"]
     )
 
-    prompt = f"""Based STRICTLY on the passage below, answer the
-following multiple-choice question.
+    prompt = f"""
+Based STRICTLY on the passage below, answer the following
+multiple-choice question.
 
 Reply with ONLY the option ID.
 
 Valid option IDs are:
+
 a
 b
 c
 d
 
 Do not provide an explanation.
-Do not provide any other text.
 
 Passage:
+
 \"\"\"{chunk_text}\"\"\"
 
 Question:
+
 {mcq['question']}
 
 Options:
+
 {options_text}
 """
 
@@ -660,21 +1091,20 @@ Options:
             .lower()
         )
 
-        # First handle the ideal response:
-        # "a", "b", "c", or "d"
-        if raw_answer in {"a", "b", "c", "d"}:
+        if raw_answer in {
+            "a",
+            "b",
+            "c",
+            "d"
+        }:
+
             re_derived = raw_answer
 
         else:
-            # Handle common model responses:
-            #
-            # "answer: b"
-            # "answer is b"
-            # "b)"
-            # "The correct answer is b."
-            
+
             match = re.search(
-                r"(?:answer\s*(?:is|:)?\s*)?([abcd])(?:\)|\.|\s|$)",
+                r"(?:answer\s*(?:is|:)?\s*)?"
+                r"([abcd])(?:\)|\.|\s|$)",
                 raw_answer,
             )
 
@@ -694,7 +1124,9 @@ Options:
             return 0.0
 
         original_answer = (
-            str(mcq["correct_option_id"])
+            str(
+                mcq["correct_option_id"]
+            )
             .strip()
             .lower()
         )
@@ -708,59 +1140,25 @@ Options:
     except Exception as e:
 
         logger.warning(
-            "Self-consistency check failed for a question: %s",
+            "Self-consistency check failed: %s",
             e,
         )
 
         return 0.0
-def is_duplicate_question(
-    question: str,
-    existing_questions: list[str],
-    threshold: float = 0.85,
-) -> bool:
-    """
-    Check whether a question is an exact or near duplicate
-    of any previously accepted sanity-check question.
-    """
 
-    normalized_question = " ".join(
-        question.lower().split()
-    )
 
-    for existing in existing_questions:
-        normalized_existing = " ".join(
-            existing.lower().split()
-        )
-
-        similarity = SequenceMatcher(
-            None,
-            normalized_question,
-            normalized_existing,
-        ).ratio()
-
-        if similarity >= threshold:
-            return True
-
-    return False
+# ---------------------------------------------------------------------
+# Sanity MCQ generation
+# ---------------------------------------------------------------------
 
 def generate_sanity_mcqs_for_document(
     doc_id: str,
-    limit: int = 8,
+    limit: int = 8
 ) -> list[dict]:
     """
-    Generate 7–8 temporary sanity-check MCQs for a document.
+    Generate temporary sanity-check MCQs.
 
-    These MCQs are generated only for trainer preview.
-    They are NOT inserted into the mcqs table.
-
-    Each MCQ is validated for:
-    - valid question
-    - exactly 4 options
-    - valid correct option
-    - explanation
-    - valid difficulty
-    - independent answer verification
-    - duplicate / near-duplicate detection
+    These are NOT inserted into the mcqs table.
     """
 
     if limit < 7:
@@ -774,12 +1172,15 @@ def generate_sanity_mcqs_for_document(
     db = SessionLocal()
 
     try:
+
         chunks = (
             db.query(DocumentChunk)
             .filter(
                 DocumentChunk.parent_doc_id == doc_id
             )
-            .order_by(DocumentChunk.chunk_order)
+            .order_by(
+                DocumentChunk.chunk_order
+            )
             .all()
         )
 
@@ -791,24 +1192,30 @@ def generate_sanity_mcqs_for_document(
         samples: list[dict] = []
         accepted_questions: list[str] = []
 
-        # Process chunks in document order.
+        # ---------------------------------------------------------
+        # Process chunks
+        # ---------------------------------------------------------
+
         for chunk in chunks:
 
             if len(samples) >= limit:
                 break
 
             try:
+
                 concepts = extract_concepts_from_chunk(
                     chunk.chunk_text
                 )
 
             except Exception as e:
+
                 logger.warning(
                     "Sanity check: concept extraction failed "
                     "for chunk %s: %s",
                     chunk.chunk_id,
                     e,
                 )
+
                 continue
 
             for concept in concepts:
@@ -822,27 +1229,29 @@ def generate_sanity_mcqs_for_document(
 
                 breadth = concept.get(
                     "breadth",
-                    DEFAULT_BREADTH,
+                    DEFAULT_BREADTH
                 )
 
                 if not raw_name:
                     continue
 
                 try:
+
                     mcqs = generate_mcqs_for_concept(
                         chunk.chunk_text,
                         raw_name,
-                        breadth,
+                        breadth
                     )
 
                 except Exception as e:
+
                     logger.warning(
-                        "Sanity check: MCQ generation failed "
-                        "for concept '%s' in chunk %s: %s",
+                        "Sanity check: MCQ generation "
+                        "failed for concept '%s': %s",
                         raw_name,
-                        chunk.chunk_id,
                         e,
                     )
+
                     continue
 
                 for mcq in mcqs:
@@ -851,30 +1260,56 @@ def generate_sanity_mcqs_for_document(
                         break
 
                     try:
+
                         # -------------------------------------------------
-                        # 1. Structural validation
+                        # Structural validation
                         # -------------------------------------------------
+
                         mcq = normalize_mcq(mcq)
 
                         question = mcq["question"]
 
                         # -------------------------------------------------
-                        # 2. Explanation validation
+                        # Quality validation
                         # -------------------------------------------------
-                        explanation = mcq.get("explanation")
+
+                        quality_ok, quality_reason = (
+                            validate_mcq_quality(mcq)
+                        )
+
+                        if not quality_ok:
+
+                            logger.warning(
+                                "Sanity check: low-quality "
+                                "MCQ rejected: %s",
+                                quality_reason,
+                            )
+
+                            continue
+
+                        # -------------------------------------------------
+                        # Explanation validation
+                        # -------------------------------------------------
+
+                        explanation = mcq.get(
+                            "explanation"
+                        )
 
                         if not explanation or not str(
                             explanation
                         ).strip():
+
                             logger.warning(
-                                "Sanity check: MCQ rejected because "
-                                "explanation is missing."
+                                "Sanity check: MCQ rejected "
+                                "because explanation is missing."
                             )
+
                             continue
 
                         # -------------------------------------------------
-                        # 3. Difficulty validation
+                        # Difficulty validation
                         # -------------------------------------------------
+
                         valid_difficulties = {
                             "easy",
                             "medium",
@@ -882,51 +1317,61 @@ def generate_sanity_mcqs_for_document(
                         }
 
                         difficulty = str(
-                            mcq.get("difficulty", "")
+                            mcq.get(
+                                "difficulty",
+                                ""
+                            )
                         ).strip().lower()
 
                         if difficulty not in valid_difficulties:
+
                             logger.warning(
                                 "Sanity check: invalid difficulty '%s'",
                                 difficulty,
                             )
+
                             continue
 
                         # -------------------------------------------------
-                        # 4. Duplicate / near-duplicate validation
+                        # Duplicate validation
                         # -------------------------------------------------
+
                         if is_duplicate_question(
                             question,
-                            accepted_questions,
+                            accepted_questions
                         ):
+
                             logger.warning(
                                 "Sanity check: duplicate or "
                                 "near-duplicate question rejected: %s",
                                 question,
                             )
+
                             continue
 
                         # -------------------------------------------------
-                        # 5. Independent answer verification
+                        # Self-consistency
                         # -------------------------------------------------
+
                         confidence = self_consistency_check(
                             mcq,
-                            chunk.chunk_text,
+                            chunk.chunk_text
                         )
 
-                        # A confidence of 0 means the independent
-                        # verification disagreed with the generated answer.
                         if confidence <= 0:
+
                             logger.warning(
-                                "Sanity check: low-confidence MCQ "
-                                "rejected: %s",
+                                "Sanity check: low-confidence "
+                                "MCQ rejected: %s",
                                 question,
                             )
+
                             continue
 
                         # -------------------------------------------------
-                        # 6. Accept validated MCQ
+                        # Accept
                         # -------------------------------------------------
+
                         samples.append(
                             {
                                 "question": question,
@@ -939,7 +1384,9 @@ def generate_sanity_mcqs_for_document(
                                 ).strip(),
                                 "difficulty": difficulty,
                                 "concept_name": raw_name,
-                                "source_chunk_id": chunk.chunk_id,
+                                "source_chunk_id": (
+                                    chunk.chunk_id
+                                ),
                                 "confidence_score": confidence,
                             }
                         )
@@ -949,18 +1396,22 @@ def generate_sanity_mcqs_for_document(
                         )
 
                     except Exception as e:
+
                         logger.warning(
-                            "Sanity check: invalid MCQ skipped "
-                            "for concept '%s': %s",
+                            "Sanity check: invalid MCQ "
+                            "skipped for concept '%s': %s",
                             raw_name,
                             e,
                         )
+
                         continue
 
-        # -------------------------------------------------------------
-        # Final requirement: at least 7 valid questions
-        # -------------------------------------------------------------
+        # ---------------------------------------------------------
+        # Final sanity requirement
+        # ---------------------------------------------------------
+
         if len(samples) < 7:
+
             raise ValueError(
                 f"Sanity check generated only "
                 f"{len(samples)} valid MCQs. "
@@ -972,27 +1423,42 @@ def generate_sanity_mcqs_for_document(
 
     finally:
         db.close()
+
+
 # ---------------------------------------------------------------------
-# Orchestration: one chunk end-to-end
+# Step 5: Process one chunk
 # ---------------------------------------------------------------------
-def process_chunk(db: Session, chunk: DocumentChunk) -> McqGenerationLog:
+
+def process_chunk(
+    db: Session,
+    chunk: DocumentChunk
+) -> McqGenerationLog:
+
     log_row = (
         db.query(McqGenerationLog)
-        .filter_by(chunk_id=chunk.chunk_id)
+        .filter_by(
+            chunk_id=chunk.chunk_id
+        )
         .first()
     )
 
     if log_row is None:
+
         log_row = McqGenerationLog(
             chunk_id=chunk.chunk_id,
             status="pending",
         )
+
         db.add(log_row)
 
     try:
-        concepts = extract_concepts_from_chunk(chunk.chunk_text)
+
+        concepts = extract_concepts_from_chunk(
+            chunk.chunk_text
+        )
 
     except Exception as e:
+
         logger.error(
             "Concept extraction failed for chunk %s: %s",
             chunk.chunk_id,
@@ -1008,6 +1474,7 @@ def process_chunk(db: Session, chunk: DocumentChunk) -> McqGenerationLog:
         return log_row
 
     if not concepts:
+
         log_row.status = "skipped_no_concepts"
         log_row.concepts_found = 0
         log_row.processed_at = datetime.utcnow()
@@ -1018,22 +1485,42 @@ def process_chunk(db: Session, chunk: DocumentChunk) -> McqGenerationLog:
 
     total_mcqs_generated = 0
 
+    # ---------------------------------------------------------
+    # Process each concept
+    # ---------------------------------------------------------
+
     for concept in concepts:
 
-        raw_name = concept.get("name", "").strip()
-        suggested_domain = concept.get("suggested_domain")
-        breadth = concept.get("breadth", DEFAULT_BREADTH)
+        raw_name = str(
+            concept.get("name", "")
+        ).strip()
+
+        suggested_domain = concept.get(
+            "suggested_domain"
+        )
+
+        breadth = concept.get(
+            "breadth",
+            DEFAULT_BREADTH
+        )
 
         if not raw_name:
             continue
 
-        canonical_id, score = match_concept_to_taxonomy(
-            db,
-            raw_name,
-            suggested_domain,
+        # ---------------------------------------------------------
+        # Concept matching
+        # ---------------------------------------------------------
+
+        canonical_id, score = (
+            match_concept_to_taxonomy(
+                db,
+                raw_name,
+                suggested_domain
+            )
         )
 
         if canonical_id is None:
+
             flag_for_review(
                 db,
                 raw_name,
@@ -1042,16 +1529,23 @@ def process_chunk(db: Session, chunk: DocumentChunk) -> McqGenerationLog:
                 best_match_concept_id=None,
                 best_match_score=score,
             )
+
             continue
 
+        # ---------------------------------------------------------
+        # Generate MCQs
+        # ---------------------------------------------------------
+
         try:
+
             mcqs = generate_mcqs_for_concept(
                 chunk.chunk_text,
                 raw_name,
-                breadth,
+                breadth
             )
 
         except Exception as e:
+
             logger.warning(
                 "MCQ generation failed for concept '%s' "
                 "in chunk %s: %s",
@@ -1059,18 +1553,88 @@ def process_chunk(db: Session, chunk: DocumentChunk) -> McqGenerationLog:
                 chunk.chunk_id,
                 e,
             )
+
             continue
+
+        # ---------------------------------------------------------
+        # Final validation + database insertion
+        # ---------------------------------------------------------
+
+        inserted_questions: list[str] = []
 
         for mcq in mcqs:
 
             try:
-                # Final validation before database insertion.
+
+                # Structural validation
                 mcq = normalize_mcq(mcq)
 
-                confidence = self_consistency_check(
+                # Quality validation
+                quality_ok, quality_reason = (
+                    validate_mcq_quality(mcq)
+                )
+
+                if not quality_ok:
+
+                    logger.warning(
+                        "Concept '%s': rejecting low-quality "
+                        "MCQ before DB insertion: %s",
+                        raw_name,
+                        quality_reason,
+                    )
+
+                    continue
+                # Source/concept relevance validation
+                relevance_ok, relevance_reason = validate_mcq_relevance(
                     mcq,
                     chunk.chunk_text,
+                    raw_name,
                 )
+
+                if not relevance_ok:
+                    logger.warning(
+                        "Concept '%s': rejecting irrelevant "
+                        "MCQ before DB insertion: %s",
+                        raw_name,
+                        relevance_reason,
+                    )
+                    continue
+
+                # Duplicate question validation
+                if is_duplicate_question(
+                    mcq["question"],
+                    inserted_questions
+                ):
+
+                    logger.warning(
+                        "Concept '%s': rejecting duplicate "
+                        "MCQ before DB insertion: %s",
+                        raw_name,
+                        mcq["question"],
+                    )
+
+                    continue
+
+                # Self-consistency
+                confidence = self_consistency_check(
+                    mcq,
+                    chunk.chunk_text
+                )
+
+                if confidence <= 0:
+
+                    logger.warning(
+                        "Concept '%s': rejecting MCQ because "
+                        "self-consistency check failed: %s",
+                        raw_name,
+                        mcq["question"],
+                    )
+
+                    continue
+
+                # -------------------------------------------------
+                # Insert
+                # -------------------------------------------------
 
                 db.add(
                     MCQ(
@@ -1078,23 +1642,38 @@ def process_chunk(db: Session, chunk: DocumentChunk) -> McqGenerationLog:
                         concept_id=canonical_id,
                         source_chunk_id=chunk.chunk_id,
                         options=mcq["options"],
-                        correct_option_id=mcq["correct_option_id"],
-                        explanation=mcq.get("explanation"),
+                        correct_option_id=(
+                            mcq["correct_option_id"]
+                        ),
+                        explanation=mcq.get(
+                            "explanation"
+                        ),
                         difficulty=mcq["difficulty"],
                         status="live",
                         confidence_score=confidence,
                     )
                 )
 
+                inserted_questions.append(
+                    mcq["question"]
+                )
+
                 total_mcqs_generated += 1
 
             except Exception as e:
+
                 logger.warning(
-                    "Skipping malformed MCQ for concept '%s': %s",
+                    "Skipping malformed MCQ for concept "
+                    "'%s': %s",
                     raw_name,
                     e,
                 )
+
                 continue
+
+    # ---------------------------------------------------------
+    # Update generation log
+    # ---------------------------------------------------------
 
     log_row.status = "processed"
     log_row.concepts_found = len(concepts)
@@ -1105,44 +1684,90 @@ def process_chunk(db: Session, chunk: DocumentChunk) -> McqGenerationLog:
 
     return log_row
 
+
 # ---------------------------------------------------------------------
-# Batch entry point
+# Step 6: Batch processing
 # ---------------------------------------------------------------------
 
-def process_pending_chunks(limit: int = 20, doc_id: str | None = None) -> None:
+def process_pending_chunks(
+    limit: int = 20,
+    doc_id: str | None = None
+) -> None:
     """
-    Processes up to `limit` chunks that either have no log row yet, or
-    previously errored (safe to retry). Never re-processes a chunk that
-    already succeeded or was cleanly skipped — run this repeatedly to
-    work through the full document_chunks table incrementally.
+    Process pending document chunks.
+    """
 
-    If `doc_id` is given, only processes chunks from that specific
-    document (parent_doc_id) -- lets you deliberately build deep,
-    complete coverage on a chosen document rather than sampling
-    scattered chunks across many documents.
-    """
     db = SessionLocal()
+
     try:
+
         already_done = (
-            db.query(McqGenerationLog.chunk_id)
-            .filter(McqGenerationLog.status.in_(["processed", "skipped_no_concepts"]))
+            db.query(
+                McqGenerationLog.chunk_id
+            )
+            .filter(
+                McqGenerationLog.status.in_(
+                    [
+                        "processed",
+                        "skipped_no_concepts",
+                    ]
+                )
+            )
         )
-        query = db.query(DocumentChunk).filter(~DocumentChunk.chunk_id.in_(already_done))
+
+        query = (
+            db.query(DocumentChunk)
+            .filter(
+                ~DocumentChunk.chunk_id.in_(
+                    already_done
+                )
+            )
+        )
+
         if doc_id is not None:
-            query = query.filter(DocumentChunk.parent_doc_id == doc_id)
-        pending_chunks = query.limit(limit).all()
+
+            query = query.filter(
+                DocumentChunk.parent_doc_id == doc_id
+            )
+
+        pending_chunks = (
+            query
+            .limit(limit)
+            .all()
+        )
 
         logger.info(
             "Processing %d chunk(s)%s...",
             len(pending_chunks),
-            f" from document '{doc_id}'" if doc_id else "",
+            (
+                f" from document '{doc_id}'"
+                if doc_id
+                else ""
+            ),
         )
+
         for chunk in pending_chunks:
-            logger.info("Processing chunk %s (doc: %s)", chunk.chunk_id, chunk.parent_doc_id)
-            result = process_chunk(db, chunk)
+
             logger.info(
-                "  -> status=%s concepts_found=%s mcqs_generated=%s",
-                result.status, result.concepts_found, result.mcqs_generated,
+                "Processing chunk %s (doc: %s)",
+                chunk.chunk_id,
+                chunk.parent_doc_id,
             )
+
+            result = process_chunk(
+                db,
+                chunk
+            )
+
+            logger.info(
+                "  -> status=%s "
+                "concepts_found=%s "
+                "mcqs_generated=%s",
+                result.status,
+                result.concepts_found,
+                result.mcqs_generated,
+            )
+
     finally:
+
         db.close()
