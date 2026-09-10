@@ -1,10 +1,12 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
+from app.core.deps import get_current_user
 from app.db import get_db
 from app.models.recommendation import Recommendation
 from app.models.concept_mastery import ConceptMastery
 from app.models.behavioural_rating import BehaviouralRating
+from app.models.user import User
 from app.schemas.recommendation import RecommendationResponse
 from app.services.recommendation_service import generate_recommendations
 
@@ -15,11 +17,25 @@ router = APIRouter(
 )
 
 
+def verify_employee_access(employee_id: str, current_user: User):
+    if (
+        current_user.role.value == "employee"
+        and current_user.id != employee_id
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Employees can access only their own recommendation data",
+        )
+
+
 @router.get("/skill-gap/{employee_id}")
 def get_skill_gap(
     employee_id: str,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
+    verify_employee_access(employee_id, current_user)
+
     technical_gaps = (
         db.query(ConceptMastery)
         .filter(
@@ -52,8 +68,11 @@ def update_recommendation_status(
     employee_id: str,
     course_id: str,
     status: str,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
+    verify_employee_access(employee_id, current_user)
+
     valid_statuses = {"shown", "enrolled", "ignored"}
 
     if status not in valid_statuses:
@@ -91,8 +110,11 @@ def update_recommendation_status(
 )
 def get_recommendations(
     employee_id: str,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
+    verify_employee_access(employee_id, current_user)
+
     recommendations = (
         db.query(Recommendation)
         .filter(Recommendation.employee_id == employee_id)

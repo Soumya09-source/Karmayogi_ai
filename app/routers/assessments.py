@@ -3,16 +3,32 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
+from app.core.deps import get_current_user
 from app.db import get_db
 from app.models.mcq import MCQ
 from app.models.assessment_history import AssessmentHistory
+from app.models.user import User
 from app.services import bkt
 
 router = APIRouter(prefix="/assessments", tags=["assessments"])
 
 
+def verify_employee_access(employee_id: str, current_user: User):
+    if current_user.role.value == "employee" and current_user.id != employee_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Employees can access only their own assessment data",
+        )
+
+
 @router.get("/next-question/{employee_id}")
-def next_question(employee_id: str, db: Session = Depends(get_db)):
+def next_question(
+    employee_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    verify_employee_access(employee_id, current_user)
+
     eligible_concepts = bkt.get_eligible_concepts(db, employee_id)
 
     if not eligible_concepts:
@@ -52,8 +68,10 @@ def submit_answer(
     mcq_id: str,
     selected_option_id: str,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
-    # Find the MCQ in the database.
+    verify_employee_access(employee_id, current_user)
+
     mcq = db.query(MCQ).filter(MCQ.id == mcq_id).first()
 
     if mcq is None:
@@ -62,10 +80,8 @@ def submit_answer(
             detail="MCQ not found",
         )
 
-    # Check whether the employee selected the correct option.
     correct = selected_option_id == mcq.correct_option_id
 
-    # Build the MCQ dictionary expected by the BKT service.
     mcq_data = {
         "id": mcq.id,
         "concept_id": mcq.concept_id,
@@ -74,10 +90,8 @@ def submit_answer(
         "difficulty": mcq.difficulty,
     }
 
-    # Generate an ID for this API assessment record.
     session_id = str(uuid.uuid4())
 
-    # Record the answer in assessment history.
     bkt.log_assessment_history(
         db,
         session_id,
@@ -87,7 +101,6 @@ def submit_answer(
         correct,
     )
 
-    # Apply the Bayesian Knowledge Tracing update.
     new_mastery = bkt.apply_answer(
         db,
         employee_id,
@@ -103,8 +116,15 @@ def submit_answer(
         "mastery": new_mastery,
     }
 
+
 @router.get("/history/{employee_id}")
-def get_history(employee_id: str, db: Session = Depends(get_db)):
+def get_history(
+    employee_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    verify_employee_access(employee_id, current_user)
+
     return (
         db.query(AssessmentHistory)
         .filter(AssessmentHistory.employee_id == employee_id)
