@@ -190,6 +190,118 @@ def normalize_mcq(mcq: dict) -> dict:
 
     return mcq
 
+def is_self_contained_question(question: str) -> bool:
+    """
+    Reject questions that refer to answer choices or other
+    question context instead of being independently understandable.
+    """
+    if not isinstance(question, str):
+        return False
+
+    q = re.sub(r"\s+", " ", question.strip().lower())
+
+    forbidden_patterns = [
+        r"\b(?:option|choice)\s*(?:[1-4]|[a-d])\b",
+        r"\b(?:option|choice)\s+(?:above|below)\b",
+        r"\b(?:this|that)\s+(?:option|choice)\b",
+    ]
+
+    return not any(
+        re.search(pattern, q)
+        for pattern in forbidden_patterns
+    )
+
+
+# Common words that do not provide useful evidence that a question is grounded
+# in the source passage.
+_GROUNDING_STOPWORDS = {
+    "what", "which", "who", "whom", "whose", "when", "where", "why", "how",
+    "is", "are", "was", "were", "be", "being", "been", "do", "does", "did",
+    "can", "could", "should", "would", "will", "may", "might", "the", "a",
+    "an", "and", "or", "of", "to", "in", "on", "for", "from", "by", "with",
+    "about", "as", "at", "into", "through", "during", "than", "that", "this",
+    "these", "those", "it", "its", "their", "they", "them", "describe",
+    "described", "according", "following", "main", "primary", "purpose",
+    "best", "most", "least", "correct", "true", "false", "statement",
+}
+
+
+def _meaningful_tokens(text: str) -> set[str]:
+    """Return normalized content-bearing tokens for lightweight grounding."""
+    tokens = re.findall(r"[a-z0-9]+", str(text).lower())
+    return {
+        token
+        for token in tokens
+        if len(token) > 2 and token not in _GROUNDING_STOPWORDS
+    }
+
+
+def _explicit_facts(text: str) -> set[str]:
+    """Extract numbers/years so fabricated factual values can be rejected."""
+    return set(
+        re.findall(
+            r"\b(?:19|20)\d{2}\b|\b\d+(?:\.\d+)?%?\b",
+            str(text),
+        )
+    )
+
+
+def is_mcq_grounded(mcq: dict, chunk_text: str) -> bool:
+    """
+    Lightweight deterministic source-grounding check.
+
+    This is intentionally conservative for explicit numbers/dates and checks
+    meaningful lexical overlap between the question/correct answer and the
+    source. It is a first-line validator, while self-consistency remains the
+    independent answer verification step.
+    """
+    source_tokens = _meaningful_tokens(chunk_text)
+    if not source_tokens:
+        return False
+
+    question = str(mcq.get("question", ""))
+    correct_id = str(mcq.get("correct_option_id", "")).strip().lower()
+
+    correct_text = ""
+    for option in mcq.get("options", []):
+        if str(option.get("id", "")).strip().lower() == correct_id:
+            correct_text = str(option.get("text", ""))
+            break
+
+    # Any explicit number/year in the question or correct answer must occur
+    # in the source. This directly catches fabricated facts such as "2024"
+    # when the passage never mentions 2024.
+    source_facts = _explicit_facts(chunk_text)
+    candidate_facts = _explicit_facts(f"{question} {correct_text}")
+    if not candidate_facts.issubset(source_facts):
+        return False
+
+    question_tokens = _meaningful_tokens(question)
+    correct_tokens = _meaningful_tokens(correct_text)
+
+    if not question_tokens or not correct_tokens:
+        return False
+
+    question_overlap = question_tokens & source_tokens
+    correct_overlap = correct_tokens & source_tokens
+
+    # Very short questions can be grounded by a single strong anchor.
+    if len(question_tokens) <= 3:
+        question_grounded = bool(question_overlap)
+    else:
+        question_grounded = (
+            len(question_overlap) >= 2
+            and len(question_overlap) / len(question_tokens) >= 0.20
+        )
+
+    # The correct answer must also contain at least one source-supported
+    # content term. This rejects generic/unsupported answers such as an
+    # invented entity or date.
+    answer_grounded = bool(correct_overlap)
+
+    return question_grounded and answer_grounded
+
+
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 _embedding_model = None  # lazy-loaded singleton, avoid reloading per call
 
@@ -224,6 +336,12 @@ MCQ_PLAN_BY_BREADTH = {
     "broad":    {"easy": 4, "medium": 5, "hard": 3},   # 12 total
 }
 DEFAULT_BREADTH = "moderate"  # fallback if the LLM omits/mis-formats this field
+
+# Safety bounds for fallback generation. These limits apply to the current
+# generation run only and prevent repeated Ollama calls from becoming costly.
+MAX_FALLBACK_ATTEMPTS_PER_QUESTION = 3
+MAX_TOTAL_GENERATION_ATTEMPTS = 15
+
 
 
 # ---------------------------------------------------------------------
@@ -369,14 +487,28 @@ def flag_for_review(
 def generate_single_mcq(
     chunk_text: str,
     concept_name: str,
-    difficulty: str
+    difficulty: str,
+    excluded_questions: list[str] | None = None,
 ) -> dict:
     """
     Fallback path: generates exactly ONE MCQ at the given difficulty.
 
-    The generated MCQ is normalized before being returned so that
-    option IDs are always a/b/c/d.
+    Previously attempted questions are supplied so fallback generation
+    does not repeat or closely paraphrase questions that were already
+    accepted or rejected during the current run.
     """
+    excluded_questions = excluded_questions or []
+
+    excluded_block = ""
+    if excluded_questions:
+        excluded_block = """
+QUESTIONS ALREADY ATTEMPTED:
+Do NOT generate a question that repeats, lightly rewords, or closely
+paraphrases any of these questions:
+
+""" + "\n".join(
+            f"- {question}" for question in excluded_questions[-20:]
+        )
 
     prompt = f"""You are writing ONE multiple-choice question for a training
 platform for Indian government statistical officers, based STRICTLY on the
@@ -388,6 +520,8 @@ Concept being tested: "{concept_name}"
 
 Required difficulty: "{difficulty}"
 
+{excluded_block}
+
 Write exactly ONE question with:
 
 - exactly 4 options
@@ -395,6 +529,17 @@ Write exactly ONE question with:
 - one-sentence explanation
 - option IDs MUST be exactly "a", "b", "c", "d"
 - correct_option_id MUST be exactly one of "a", "b", "c", "d"
+- the question must be completely self-contained
+- do NOT refer to option numbers or option letters
+- do NOT use phrases such as "option 1", "option A", "choice B",
+  "the option above", or "the choice below"
+- the question and correct answer must be answerable from the supplied passage
+- do not introduce dates, numbers, entities, or facts that are absent from
+  the supplied passage
+- keep all four options reasonably similar in length and grammatical form
+- do not make the correct answer noticeably longer or more detailed merely
+  because it is the correct answer
+- do NOT repeat or closely paraphrase an attempted question
 
 Do NOT use numeric option IDs such as 1, 2, 3, 4.
 Do NOT add punctuation to option IDs.
@@ -431,15 +576,67 @@ Passage:
     result["difficulty"] = difficulty
 
     # Normalize and validate the generated MCQ.
-    result = normalize_mcq(result)
+    return normalize_mcq(result)
 
-    return result
+def _validate_generated_mcq_for_generation(
+    mcq: dict,
+    chunk_text: str,
+    attempted_questions: list[str],
+    generation_state: dict,
+    concept_name: str,
+    difficulty: str,
+) -> tuple[bool, str | None]:
+    """
+    Validate a generated MCQ before it is counted toward the requested
+    difficulty quota.
+
+    This is used by the sanity-generation path so invalid candidates do not
+    artificially satisfy the batch quota. `attempted_questions` is updated by
+    the caller after this function returns, regardless of acceptance.
+    """
+    question = mcq["question"]
+
+    def reject(reason: str, detail: str | None = None) -> tuple[bool, str]:
+        counts = generation_state["rejection_counts"]
+        counts[reason] = counts.get(reason, 0) + 1
+        suffix = f" ({detail})" if detail else ""
+        logger.warning(
+            "Concept '%s' (%s): %s%s: %s",
+            concept_name,
+            difficulty,
+            reason,
+            suffix,
+            question,
+        )
+        return False, reason
+
+    if not is_self_contained_question(question):
+        return reject("REJECTED_SELF_REFERENCE")
+
+    # Hard application-level duplicate guard. Never rely only on the LLM
+    # following the "do not repeat" prompt instruction.
+    # Check this before expensive grounding/self-consistency calls.
+    if is_duplicate_question(question, attempted_questions):
+        return reject("REJECTED_DUPLICATE")
+
+    if not is_mcq_grounded(mcq, chunk_text):
+        return reject("REJECTED_NOT_GROUNDED")
+
+    confidence = self_consistency_check(mcq, chunk_text)
+    if confidence <= 0:
+        return reject("REJECTED_SELF_CONSISTENCY")
+
+    mcq["confidence_score"] = confidence
+    return True, None
 
 
 def generate_mcqs_for_concept(
     chunk_text: str,
     concept_name: str,
-    breadth: str
+    breadth: str,
+    attempted_questions: list[str] | None = None,
+    generation_state: dict | None = None,
+    quality_validate: bool = False,
 ) -> list[dict]:
     """
     Generate a difficulty-varied batch of MCQs for a concept.
@@ -448,10 +645,18 @@ def generate_mcqs_for_concept(
         One schema-constrained Ollama call per difficulty.
 
     Fallback:
-        Generate missing questions one at a time.
+        Generate missing questions one at a time, with bounded retries.
 
-    Every MCQ is normalized and validated before being returned.
+    `attempted_questions` is intentionally in-memory and is owned by the
+    current sanity-generation run. Every structurally usable generated
+    question is recorded, including questions that are rejected by quality
+    validation.
     """
+    attempted_questions = attempted_questions if attempted_questions is not None else []
+    generation_state = generation_state if generation_state is not None else {
+        "total_generation_attempts": 0,
+        "rejection_counts": {},
+    }
 
     plan = MCQ_PLAN_BY_BREADTH.get(
         breadth,
@@ -461,9 +666,18 @@ def generate_mcqs_for_concept(
     all_mcqs: list[dict] = []
 
     for difficulty, count in plan.items():
-
         if count == 0:
             continue
+
+        excluded_block = ""
+        if attempted_questions:
+            excluded_block = """
+QUESTIONS ALREADY ATTEMPTED:
+Do NOT repeat, lightly reword, or closely paraphrase any of these questions:
+
+""" + "\n".join(
+                f"- {question}" for question in attempted_questions[-20:]
+            )
 
         prompt = f"""You are writing multiple-choice questions for a training
 platform for Indian government statistical officers.
@@ -479,6 +693,8 @@ Concept being tested:
 Required difficulty for ALL questions:
 "{difficulty}"
 
+{excluded_block}
+
 Write exactly {count} DISTINCT questions.
 
 Each question must:
@@ -489,6 +705,16 @@ Each question must:
 4. Have exactly one correct answer.
 5. Have a concise one-sentence explanation.
 6. Be answerable using the supplied passage.
+7. Be completely self-contained.
+8. Never refer to an option number, option letter, or another answer choice.
+9. Never introduce dates, numbers, entities, or facts absent from the passage.
+10. Not repeat or closely paraphrase any attempted question.
+
+IMPORTANT OPTION QUALITY:
+- Keep all four options reasonably similar in length and grammatical form.
+- Do not make the correct answer noticeably longer or more detailed merely
+  because it is correct.
+- Make distractors plausible but clearly incorrect based on the passage.
 
 IMPORTANT OPTION FORMAT:
 
@@ -513,22 +739,32 @@ Passage:
 \"\"\"{chunk_text}\"\"\"
 """
 
+        batch: list = []
+
+        # One schema-constrained generation call counts as one generation
+        # attempt against the overall run cap.
+        if generation_state["total_generation_attempts"] >= MAX_TOTAL_GENERATION_ATTEMPTS:
+            logger.warning(
+                "Generation attempt cap reached (%d). Stopping further "
+                "generation for concept '%s'.",
+                MAX_TOTAL_GENERATION_ATTEMPTS,
+                concept_name,
+            )
+            break
+
+        generation_state["total_generation_attempts"] += 1
+
         try:
-
             schema = ollama_client.mcq_array_schema(count)
-
             result = ollama_client.generate_json(
                 prompt,
                 schema=schema
             )
-
             batch = _coerce_to_list(
                 result,
                 context=f"MCQ generation ({difficulty})"
             )
-
         except Exception as e:
-
             logger.warning(
                 "Concept '%s' (%s): schema-constrained batch "
                 "call failed: %s. Falling back to one-at-a-time "
@@ -537,43 +773,77 @@ Passage:
                 difficulty,
                 e,
             )
-
             batch = []
 
         valid_batch_count = 0
 
-        # Normalize and validate every generated MCQ.
+        # A candidate is only counted toward the requested quota after the
+        # enabled quality checks have passed. Rejected candidates are still
+        # recorded in attempted_questions so later Ollama calls do not repeat
+        # them.
         for mcq in batch:
-
             try:
-
                 mcq = normalize_mcq(mcq)
+                question = mcq["question"]
+                previous_attempts = list(attempted_questions)
 
-                # Never trust the model's difficulty field.
+                if quality_validate:
+                    accepted, _ = _validate_generated_mcq_for_generation(
+                        mcq,
+                        chunk_text,
+                        previous_attempts,
+                        generation_state,
+                        concept_name,
+                        difficulty,
+                    )
+                    if not accepted:
+                        attempted_questions.append(question)
+                        continue
+                else:
+                    # Preserve the existing production behavior: only the
+                    # structural normalization and self-reference check happen
+                    # here; final production validation remains in process_chunk.
+                    if not is_self_contained_question(question):
+                        generation_state["rejection_counts"][
+                            "REJECTED_SELF_REFERENCE"
+                        ] = generation_state["rejection_counts"].get(
+                            "REJECTED_SELF_REFERENCE", 0
+                        ) + 1
+                        logger.warning(
+                            "Concept '%s' (%s): rejected self-referencing question: %s",
+                            concept_name,
+                            difficulty,
+                            question,
+                        )
+                        attempted_questions.append(question)
+                        continue
+
                 mcq["difficulty"] = difficulty
-
+                attempted_questions.append(question)
                 all_mcqs.append(mcq)
-
                 valid_batch_count += 1
 
             except Exception as e:
-
+                generation_state["rejection_counts"]["REJECTED_INVALID_OPTIONS"] = (
+                    generation_state["rejection_counts"].get(
+                        "REJECTED_INVALID_OPTIONS", 0
+                    ) + 1
+                )
                 logger.warning(
-                    "Concept '%s' (%s): skipping malformed "
-                    "generated MCQ: %s",
+                    "Concept '%s' (%s): skipping malformed generated MCQ: %s",
                     concept_name,
                     difficulty,
                     e,
                 )
 
-        # Generate missing questions individually.
+        # Generate missing questions individually, with both a per-question
+        # retry limit and an overall generation-attempt cap.
         shortfall = count - valid_batch_count
 
         if shortfall > 0:
-
             logger.warning(
                 "Concept '%s' (%s): valid generation returned "
-                "%d/%d questions. Generating %d more individually.",
+                "%d/%d questions. Generating up to %d fallback questions.",
                 concept_name,
                 difficulty,
                 valid_batch_count,
@@ -582,33 +852,94 @@ Passage:
             )
 
             for _ in range(shortfall):
+                fallback_success = False
+                fallback_attempts = 0
 
-                try:
+                while (
+                    not fallback_success
+                    and fallback_attempts < MAX_FALLBACK_ATTEMPTS_PER_QUESTION
+                    and generation_state["total_generation_attempts"]
+                    < MAX_TOTAL_GENERATION_ATTEMPTS
+                ):
+                    fallback_attempts += 1
+                    generation_state["total_generation_attempts"] += 1
 
-                    mcq = generate_single_mcq(
-                        chunk_text,
-                        concept_name,
-                        difficulty
-                    )
+                    try:
+                        mcq = generate_single_mcq(
+                            chunk_text,
+                            concept_name,
+                            difficulty,
+                            excluded_questions=attempted_questions,
+                        )
 
-                    all_mcqs.append(mcq)
+                        question = mcq["question"]
+                        previous_attempts = list(attempted_questions)
 
-                except Exception as e:
+                        if quality_validate:
+                            # The validator performs a hard duplicate check
+                            # against every previously attempted question,
+                            # including rejected candidates.
+                            accepted, _ = _validate_generated_mcq_for_generation(
+                                mcq,
+                                chunk_text,
+                                previous_attempts,
+                                generation_state,
+                                concept_name,
+                                difficulty,
+                            )
+                            if not accepted:
+                                attempted_questions.append(question)
+                                continue
+                        else:
+                            if not is_self_contained_question(question):
+                                generation_state["rejection_counts"][
+                                    "REJECTED_SELF_REFERENCE"
+                                ] = generation_state["rejection_counts"].get(
+                                    "REJECTED_SELF_REFERENCE", 0
+                                ) + 1
+                                logger.warning(
+                                    "Concept '%s' (%s): fallback attempt %d/%d "
+                                    "rejected self-referencing question: %s",
+                                    concept_name,
+                                    difficulty,
+                                    fallback_attempts,
+                                    MAX_FALLBACK_ATTEMPTS_PER_QUESTION,
+                                    question,
+                                )
+                                attempted_questions.append(question)
+                                continue
 
+                        attempted_questions.append(question)
+                        all_mcqs.append(mcq)
+                        fallback_success = True
+
+                    except Exception as e:
+                        generation_state["rejection_counts"][
+                            "REJECTED_INVALID_OPTIONS"
+                        ] = generation_state["rejection_counts"].get(
+                            "REJECTED_INVALID_OPTIONS", 0
+                        ) + 1
+                        logger.warning(
+                            "Concept '%s' (%s): fallback attempt %d/%d "
+                            "failed: %s",
+                            concept_name,
+                            difficulty,
+                            fallback_attempts,
+                            MAX_FALLBACK_ATTEMPTS_PER_QUESTION,
+                            e,
+                        )
+
+                if not fallback_success:
                     logger.warning(
-                        "Concept '%s' (%s): fallback "
-                        "single-question generation failed: %s",
+                        "Concept '%s' (%s): could not fill one missing "
+                        "question after %d fallback attempts or due to "
+                        "the overall generation cap.",
                         concept_name,
                         difficulty,
-                        e,
+                        fallback_attempts,
                     )
 
     return all_mcqs
-
-
-# ---------------------------------------------------------------------
-# Step 4: self-consistency confidence check
-# ---------------------------------------------------------------------
 
 def self_consistency_check(
     mcq: dict,
@@ -713,24 +1044,38 @@ Options:
         )
 
         return 0.0
+def _normalize_question_for_comparison(question: str) -> str:
+    """Normalize punctuation, whitespace, and case for obvious duplicates."""
+    return re.sub(
+        r"[^a-z0-9\s]",
+        " ",
+        str(question).lower(),
+    ).strip()
+
+
 def is_duplicate_question(
     question: str,
     existing_questions: list[str],
     threshold: float = 0.85,
 ) -> bool:
     """
-    Check whether a question is an exact or near duplicate
-    of any previously accepted sanity-check question.
-    """
+    Check for an exact normalized duplicate first, then use the existing
+    SequenceMatcher threshold for near-duplicate detection.
 
+    The 0.85 threshold is intentionally unchanged from the previous system.
+    """
     normalized_question = " ".join(
-        question.lower().split()
+        _normalize_question_for_comparison(question).split()
     )
 
     for existing in existing_questions:
         normalized_existing = " ".join(
-            existing.lower().split()
+            _normalize_question_for_comparison(existing).split()
         )
+
+        # Fast obvious-duplicate check.
+        if normalized_question == normalized_existing:
+            return True
 
         similarity = SequenceMatcher(
             None,
@@ -753,16 +1098,18 @@ def generate_sanity_mcqs_for_document(
     These MCQs are generated only for trainer preview.
     They are NOT inserted into the mcqs table.
 
-    Each MCQ is validated for:
-    - valid question
-    - exactly 4 options
-    - valid correct option
+    Validation includes:
+    - structural validity
     - explanation
-    - valid difficulty
-    - independent answer verification
-    - duplicate / near-duplicate detection
-    """
+    - difficulty
+    - self-contained question
+    - source grounding
+    - exact/near-duplicate detection
+    - independent self-consistency
+    - explicit rejection-reason tracking
 
+    `attempted_questions` exists only for this in-memory generation run.
+    """
     if limit < 7:
         raise ValueError(
             "Sanity check must generate at least 7 MCQs"
@@ -789,11 +1136,31 @@ def generate_sanity_mcqs_for_document(
             )
 
         samples: list[dict] = []
-        accepted_questions: list[str] = []
+
+        # This list is intentionally in-memory and scoped to this single
+        # sanity-generation run. It contains both accepted and rejected
+        # questions so later Ollama calls avoid repeating them.
+        attempted_questions: list[str] = []
+
+        generation_state = {
+            "total_generation_attempts": 0,
+            "rejection_counts": {},
+        }
+
+        def reject(reason: str, question: str, detail: str | None = None) -> None:
+            counts = generation_state["rejection_counts"]
+            counts[reason] = counts.get(reason, 0) + 1
+
+            suffix = f" ({detail})" if detail else ""
+            logger.warning(
+                "Sanity check: %s%s: %s",
+                reason,
+                suffix,
+                question,
+            )
 
         # Process chunks in document order.
         for chunk in chunks:
-
             if len(samples) >= limit:
                 break
 
@@ -801,7 +1168,6 @@ def generate_sanity_mcqs_for_document(
                 concepts = extract_concepts_from_chunk(
                     chunk.chunk_text
                 )
-
             except Exception as e:
                 logger.warning(
                     "Sanity check: concept extraction failed "
@@ -812,7 +1178,6 @@ def generate_sanity_mcqs_for_document(
                 continue
 
             for concept in concepts:
-
                 if len(samples) >= limit:
                     break
 
@@ -833,8 +1198,10 @@ def generate_sanity_mcqs_for_document(
                         chunk.chunk_text,
                         raw_name,
                         breadth,
+                        attempted_questions=attempted_questions,
+                        generation_state=generation_state,
+                        quality_validate=True,
                     )
-
                 except Exception as e:
                     logger.warning(
                         "Sanity check: MCQ generation failed "
@@ -846,7 +1213,6 @@ def generate_sanity_mcqs_for_document(
                     continue
 
                 for mcq in mcqs:
-
                     if len(samples) >= limit:
                         break
 
@@ -855,20 +1221,23 @@ def generate_sanity_mcqs_for_document(
                         # 1. Structural validation
                         # -------------------------------------------------
                         mcq = normalize_mcq(mcq)
-
                         question = mcq["question"]
+
+                        # MCQs returned by generation should already have
+                        # been recorded, but append defensively if a caller
+                        # supplies an externally generated candidate.
+                        if question not in attempted_questions:
+                            attempted_questions.append(question)
 
                         # -------------------------------------------------
                         # 2. Explanation validation
                         # -------------------------------------------------
                         explanation = mcq.get("explanation")
-
-                        if not explanation or not str(
-                            explanation
-                        ).strip():
-                            logger.warning(
-                                "Sanity check: MCQ rejected because "
-                                "explanation is missing."
+                        if not explanation or not str(explanation).strip():
+                            reject(
+                                "REJECTED_INVALID_OPTIONS",
+                                question,
+                                "missing explanation",
                             )
                             continue
 
@@ -886,46 +1255,69 @@ def generate_sanity_mcqs_for_document(
                         ).strip().lower()
 
                         if difficulty not in valid_difficulties:
-                            logger.warning(
-                                "Sanity check: invalid difficulty '%s'",
-                                difficulty,
+                            reject(
+                                "REJECTED_INVALID_OPTIONS",
+                                question,
+                                f"invalid difficulty '{difficulty}'",
                             )
                             continue
 
                         # -------------------------------------------------
-                        # 4. Duplicate / near-duplicate validation
+                        # 4. Self-contained question validation
                         # -------------------------------------------------
-                        if is_duplicate_question(
-                            question,
-                            accepted_questions,
-                        ):
-                            logger.warning(
-                                "Sanity check: duplicate or "
-                                "near-duplicate question rejected: %s",
+                        if not is_self_contained_question(question):
+                            reject(
+                                "REJECTED_SELF_REFERENCE",
                                 question,
                             )
                             continue
 
                         # -------------------------------------------------
-                        # 5. Independent answer verification
+                        # 5. Source-grounding validation
+                        # -------------------------------------------------
+                        if not is_mcq_grounded(
+                            mcq,
+                            chunk.chunk_text,
+                        ):
+                            reject(
+                                "REJECTED_NOT_GROUNDED",
+                                question,
+                            )
+                            continue
+
+                        # -------------------------------------------------
+                        # 6. Duplicate / near-duplicate validation
+                        # -------------------------------------------------
+                        accepted_questions = [
+                            sample["question"] for sample in samples
+                        ]
+                        if is_duplicate_question(
+                            question,
+                            accepted_questions,
+                        ):
+                            reject(
+                                "REJECTED_DUPLICATE",
+                                question,
+                            )
+                            continue
+
+                        # -------------------------------------------------
+                        # 7. Independent answer verification
                         # -------------------------------------------------
                         confidence = self_consistency_check(
                             mcq,
                             chunk.chunk_text,
                         )
 
-                        # A confidence of 0 means the independent
-                        # verification disagreed with the generated answer.
                         if confidence <= 0:
-                            logger.warning(
-                                "Sanity check: low-confidence MCQ "
-                                "rejected: %s",
+                            reject(
+                                "REJECTED_SELF_CONSISTENCY",
                                 question,
                             )
                             continue
 
                         # -------------------------------------------------
-                        # 6. Accept validated MCQ
+                        # 8. Accept validated MCQ
                         # -------------------------------------------------
                         samples.append(
                             {
@@ -944,37 +1336,48 @@ def generate_sanity_mcqs_for_document(
                             }
                         )
 
-                        accepted_questions.append(
-                            question
-                        )
-
                     except Exception as e:
-                        logger.warning(
-                            "Sanity check: invalid MCQ skipped "
-                            "for concept '%s': %s",
-                            raw_name,
-                            e,
+                        question_for_log = (
+                            str(mcq.get("question", "<unknown>"))
+                            if isinstance(mcq, dict)
+                            else "<unknown>"
+                        )
+                        reject(
+                            "REJECTED_INVALID_OPTIONS",
+                            question_for_log,
+                            str(e),
                         )
                         continue
 
         # -------------------------------------------------------------
         # Final requirement: at least 7 valid questions
         # -------------------------------------------------------------
+        rejection_counts = generation_state["rejection_counts"]
+        logger.info(
+            "Sanity check summary for document '%s': "
+            "valid=%d, generation_attempts=%d, rejections=%s",
+            doc_id,
+            len(samples),
+            generation_state["total_generation_attempts"],
+            rejection_counts,
+        )
+
         if len(samples) < 7:
             raise ValueError(
                 f"Sanity check generated only "
                 f"{len(samples)} valid MCQs. "
                 f"At least 7 are required for document "
-                f"'{doc_id}'"
+                f"'{doc_id}'. "
+                f"Generation attempts: "
+                f"{generation_state['total_generation_attempts']}. "
+                f"Rejections: {rejection_counts}"
             )
 
         return samples[:limit]
 
     finally:
         db.close()
-# ---------------------------------------------------------------------
-# Orchestration: one chunk end-to-end
-# ---------------------------------------------------------------------
+
 def process_chunk(db: Session, chunk: DocumentChunk) -> McqGenerationLog:
     log_row = (
         db.query(McqGenerationLog)

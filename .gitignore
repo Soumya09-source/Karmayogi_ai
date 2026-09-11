@@ -2,3 +2,6 @@ venv/
 __pycache__/
 *.pyc
 .env
+ai_mcqs.csv
+karmayogi_demo.dump
+my_backup_before_sync.dump
